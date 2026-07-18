@@ -1,0 +1,26 @@
+# AetherGate production edge (TLS via Let's Encrypt)
+
+{
+    email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+    root * /srv/portal
+    file_server
+}
+
+chat.{$DOMAIN} {
+    reverse_proxy open-webui:8080
+}
+
+llm.{$DOMAIN} {
+    reverse_proxy litellm:4000
+}
+
+auth.{$DOMAIN} {
+    reverse_proxy authentik-server:9000
+}
+
+admin.{$DOMAIN} {
+    reverse_proxy admin:9100
+}

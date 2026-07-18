@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AetherGate — Grand Admin</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+    <header>
+        <div class="brand-row">
+            <img src="/assets/logo.svg" alt="AetherGate" class="logo">
+            <div>
+                <h1>Grand Admin</h1>
+                <p class="sub">Ops AetherGate · FastAPI · auth Basic</p>
+            </div>
+        </div>
+        <div id="globalBadge" class="badge">Chargement…</div>
+    </header>
+    <main>
+        <section>
+            <h3>Services</h3>
+            <div class="grid" id="services"></div>
+        </section>
+        <section>
+            <h3>Consoles natives</h3>
+            <div id="links"></div>
+        </section>
+        <section>
+            <h3>Données</h3>
+            <pre id="db">…</pre>
+        </section>
+        <section>
+            <h3>Backups</h3>
+            <button class="btn" id="refreshBtn" type="button">Rafraîchir</button>
+            <button class="btn" id="backupBtn" type="button">Backup</button>
+            <div id="backupList"></div>
+            <div id="msg"></div>
+        </section>
+        <section>
+            <h3>Alertes</h3>
+            <pre id="alerts">…</pre>
+        </section>
+    </main>
+    <script src="/assets/app.js"></script>
+</body>
+</html>

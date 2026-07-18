@@ -1,0 +1,22 @@
+# AetherGate edge — Caddy
+
+:80 {
+    # Bind all hosts (localhost + 127.0.0.1) for local demos.
+    handle_path /admin/* {
+        reverse_proxy admin:9100
+    }
+
+    handle /admin {
+        redir /admin/ 302
+    }
+
+    handle /assets/* {
+        root * /srv/portal
+        file_server
+    }
+
+    handle {
+        root * /srv/portal
+        file_server
+    }
+}

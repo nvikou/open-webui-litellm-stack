@@ -1,0 +1,44 @@
+# AetherGate production overlay
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Requires DOMAIN + ACME_EMAIL in .env (or environment).
+
+services:
+  postgres:
+    ports: !reset []
+    # Grand Admin SQL only via VPN / SSH tunnel in production
+
+  litellm:
+    ports: !reset []
+
+  open-webui:
+    ports: !reset []
+    environment:
+      WEBUI_URL: https://chat.${DOMAIN}
+      OPENID_REDIRECT_URI: https://chat.${DOMAIN}/oauth/oidc/callback
+      OPENID_PROVIDER_URL: https://auth.${DOMAIN}/application/o/aethergate-openwebui/.well-known/openid-configuration
+
+  authentik-server:
+    ports: !reset []
+
+  admin:
+    ports: !reset []
+    environment:
+      OPENWEBUI_URL: https://chat.${DOMAIN}
+      LITELLM_URL: https://llm.${DOMAIN}/ui
+      SSO_URL: https://auth.${DOMAIN}
+      PORTAL_URL: https://${DOMAIN}
+
+  caddy:
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    volumes:
+      - ./infra/caddy/Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - ./infra/portal:/srv/portal:ro
+      - caddy_data:/data
+      - caddy_config:/config

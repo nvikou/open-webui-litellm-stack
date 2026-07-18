@@ -1,0 +1,58 @@
+name: aethergate-ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose files
+        run: |
+          docker compose -f docker-compose.yml config >/dev/null
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml config >/dev/null
+
+  admin-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install admin deps
+        run: pip install -r admin/backend/requirements.txt
+      - name: Compile admin backend
+        run: python -m compileall admin/backend scripts
+
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare env
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements-dev.txt
+          cp .env.example .env
+          sed -i 's/^OPENAI_API_KEY=.*/OPENAI_API_KEY=sk-test/' .env
+          sed -i 's/^HF_TOKEN=.*/HF_TOKEN=hf_test/' .env
+          .venv/bin/python scripts/generate_secrets.py
+      - name: Build admin image
+        run: docker compose build admin
+      - name: Start core services
+        run: |
+          docker compose up -d postgres redis
+          sleep 8
+          docker compose up -d litellm admin
+          sleep 20
+      - name: Health admin
+        run: curl -fsS http://127.0.0.1:9100/api/health
+      - name: Teardown
+        if: always()
+        run: docker compose down -v

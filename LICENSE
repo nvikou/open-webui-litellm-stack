@@ -1,0 +1,13 @@
+AetherGate Packaging License (Proprietary)
+
+Copyright (c) 2026 AetherGate
+
+Permission is granted to use and deploy this packaging for your organization
+or your customers, subject to COMMERCIAL.md.
+
+You may not:
+- remove attribution to AetherGate from the packaging without written consent
+- redistribute secrets, private keys, or customer .env files
+- claim that Open WebUI or LiteLLM are proprietary forks of AetherGate
+
+Upstream components remain under their respective licenses.

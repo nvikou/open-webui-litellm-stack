@@ -1,0 +1,298 @@
+# AetherGate — Open WebUI + LiteLLM + PostgreSQL + Authentik + Caddy
+name: aethergate
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aethergate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ai_platform_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ai_platform_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - aethergate
+
+  redis:
+    image: redis:7-alpine
+    container_name: aethergate-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - aethergate
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: aethergate-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - aethergate
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: aethergate-ollama-init
+    depends_on:
+      - ollama
+    volumes:
+      - ./infra/ollama/pull.sh:/pull.sh:ro
+      - ollama_data:/root/.ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_PULL_MODEL: ${OLLAMA_PULL_MODEL:-llama3.2}
+    entrypoint: ["/bin/sh", "/pull.sh"]
+    restart: "no"
+    networks:
+      - aethergate
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: aethergate-litellm
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      HF_TOKEN: ${HF_TOKEN}
+      HUGGINGFACE_API_KEY: ${HF_TOKEN}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      STORE_MODEL_IN_DB: "True"
+      PROXY_BASE_URL: ${LITELLM_BASE_URL}
+      UI_USERNAME: ${LITELLM_UI_USERNAME}
+      UI_PASSWORD: ${LITELLM_UI_PASSWORD}
+      GENERIC_CLIENT_ID: ${LITELLM_OAUTH_CLIENT_ID}
+      GENERIC_CLIENT_SECRET: ${LITELLM_OAUTH_CLIENT_SECRET}
+      GENERIC_AUTHORIZATION_ENDPOINT: ${AUTHENTIK_PUBLIC_URL}/application/o/authorize/
+      GENERIC_TOKEN_ENDPOINT: ${AUTHENTIK_PUBLIC_URL}/application/o/token/
+      GENERIC_USERINFO_ENDPOINT: ${AUTHENTIK_PUBLIC_URL}/application/o/userinfo/
+      GENERIC_SCOPE: openid email profile
+      AUTO_REDIRECT_UI_LOGIN_TO_SSO: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness')\"",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+    networks:
+      - aethergate
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: aethergate-open-webui
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+    ports:
+      - "3000:8080"
+    volumes:
+      - open_webui_data:/app/backend/data
+    environment:
+      WEBUI_NAME: AetherGate
+      WEBUI_URL: ${OPENWEBUI_BASE_URL}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/ai_platform_db?options=-csearch_path%3Dwebui
+      OPENAI_API_BASE_URL: http://litellm:4000/v1
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      ENABLE_OAUTH_SIGNUP: "true"
+      OAUTH_MERGE_ACCOUNTS_BY_EMAIL: "true"
+      OAUTH_PROVIDER_NAME: Authentik
+      OAUTH_CLIENT_ID: ${OPENWEBUI_OAUTH_CLIENT_ID}
+      OAUTH_CLIENT_SECRET: ${OPENWEBUI_OAUTH_CLIENT_SECRET}
+      OPENID_PROVIDER_URL: ${AUTHENTIK_PUBLIC_URL}/application/o/aethergate-openwebui/.well-known/openid-configuration
+      OPENID_REDIRECT_URI: ${OPENWEBUI_BASE_URL}/oauth/oidc/callback
+      ENABLE_LOGIN_FORM: "true"
+      ENABLE_PERSISTENT_CONFIG: "false"
+      OAUTH_TOKEN_ENDPOINT_AUTH_METHOD: client_secret_post
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://127.0.0.1:8080/health || exit 1",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    networks:
+      - aethergate
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2025.2.4
+    container_name: aethergate-authentik-server
+    restart: unless-stopped
+    command: server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "9000:9000"
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD}
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      OPENWEBUI_OAUTH_CLIENT_SECRET: ${OPENWEBUI_OAUTH_CLIENT_SECRET}
+      LITELLM_OAUTH_CLIENT_SECRET: ${LITELLM_OAUTH_CLIENT_SECRET}
+      AUTHENTIK_HOST: ${AUTHENTIK_PUBLIC_URL}
+      AUTHENTIK_HOST_BROWSER: ${AUTHENTIK_PUBLIC_URL}
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+      - ./infra/authentik/blueprints:/blueprints/custom:ro
+    networks:
+      - aethergate
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2025.2.4
+    container_name: aethergate-authentik-worker
+    restart: unless-stopped
+    command: worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD}
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      OPENWEBUI_OAUTH_CLIENT_SECRET: ${OPENWEBUI_OAUTH_CLIENT_SECRET}
+      LITELLM_OAUTH_CLIENT_SECRET: ${LITELLM_OAUTH_CLIENT_SECRET}
+      AUTHENTIK_HOST: ${AUTHENTIK_PUBLIC_URL}
+      AUTHENTIK_HOST_BROWSER: ${AUTHENTIK_PUBLIC_URL}
+    user: root
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+      - ./infra/authentik/blueprints:/blueprints/custom:ro
+    networks:
+      - aethergate
+
+  admin:
+    build: ./admin
+    container_name: aethergate-admin
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      litellm:
+        condition: service_started
+      open-webui:
+        condition: service_started
+      authentik-server:
+        condition: service_started
+    ports:
+      - "9100:9100"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      OPENWEBUI_HEALTH: http://open-webui:8080/health
+      LITELLM_HEALTH: http://litellm:4000/health/liveliness
+      SSO_HEALTH: http://authentik-server:9000/-/health/live/
+      OPENWEBUI_URL: http://localhost:3000
+      LITELLM_URL: http://localhost:4000/ui
+      SSO_URL: http://localhost:9000
+      PORTAL_URL: http://localhost/
+      BACKUP_DIR: /backups
+      ADMIN_DATA_DIR: /data
+      FRONTEND_DIR: /app/frontend
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-grandadmin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      ADMIN_ALERT_WEBHOOK: ${ADMIN_ALERT_WEBHOOK:-}
+      ADMIN_MONITOR_SECONDS: ${ADMIN_MONITOR_SECONDS:-60}
+    volumes:
+      - ./backups:/backups
+      - admin_data:/data
+    networks:
+      - aethergate
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: aethergate-caddy
+    restart: unless-stopped
+    depends_on:
+      - open-webui
+      - litellm
+      - authentik-server
+      - admin
+    ports:
+      - "80:80"
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./infra/portal:/srv/portal:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - aethergate
+
+volumes:
+  postgres_data:
+  open_webui_data:
+  ollama_data:
+  authentik_media:
+  authentik_templates:
+  caddy_data:
+  caddy_config:
+  admin_data:
+
+networks:
+  aethergate:
+    name: aethergate_net

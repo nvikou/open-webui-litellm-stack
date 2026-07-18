@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AetherGate</title>
+    <style>
+        :root {
+            --bg0: #0c1218;
+            --ink: #e8eef4;
+            --muted: #8fa3b5;
+            --accent: #3d9b8f;
+            --line: rgba(232, 238, 244, 0.12);
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: "Segoe UI", "Trebuchet MS", sans-serif;
+            color: var(--ink);
+            background:
+                linear-gradient(100deg, rgba(12,18,24,0.82), rgba(12,18,24,0.55)),
+                url("/assets/hero.png") center/cover no-repeat fixed,
+                var(--bg0);
+        }
+        main {
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 4.5rem 1.5rem 3rem;
+        }
+        .brand-row {
+            display: flex;
+            align-items: center;
+            gap: 0.9rem;
+            margin-bottom: 0.75rem;
+        }
+        .logo { width: 52px; height: 52px; }
+        .brand {
+            font-size: clamp(2.4rem, 6vw, 3.4rem);
+            font-weight: 700;
+            letter-spacing: -0.03em;
+            margin: 0;
+        }
+        .tag {
+            color: var(--muted);
+            font-size: 1.05rem;
+            line-height: 1.5;
+            margin: 0 0 2.5rem;
+            max-width: 36rem;
+        }
+        .grid { display: grid; gap: 0.85rem; }
+        a.entry {
+            display: block;
+            text-decoration: none;
+            color: inherit;
+            border: 1px solid var(--line);
+            padding: 1.1rem 1.25rem;
+            background: rgba(12, 18, 24, 0.55);
+            backdrop-filter: blur(6px);
+            transition: border-color 0.2s, transform 0.2s;
+        }
+        a.entry:hover {
+            border-color: var(--accent);
+            transform: translateY(-1px);
+        }
+        a.entry strong {
+            display: block;
+            font-size: 1.05rem;
+            margin-bottom: 0.25rem;
+        }
+        a.entry span { color: var(--muted); font-size: 0.92rem; }
+        footer {
+            margin-top: 2.5rem;
+            color: var(--muted);
+            font-size: 0.85rem;
+            border-top: 1px solid var(--line);
+            padding-top: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <div class="brand-row">
+            <img class="logo" src="/assets/logo.svg" alt="">
+            <h1 class="brand">AetherGate</h1>
+        </div>
+        <p class="tag">
+            Infrastructure IA prête à vendre — Open WebUI, LiteLLM,
+            PostgreSQL, SSO Authentik, Grand Admin FastAPI.
+            Règle d’or : 100&nbsp;% natif, zéro bridage.
+        </p>
+        <div class="grid">
+            <a class="entry" href="http://localhost:9100">
+                <strong>Grand Admin</strong>
+                <span>FastAPI · statut, backup/restore, alertes · Basic Auth</span>
+            </a>
+            <a class="entry" href="http://localhost:3000">
+                <strong>Open WebUI</strong>
+                <span>Chat, RAG, pipelines · port 3000</span>
+            </a>
+            <a class="entry" href="http://localhost:4000/ui">
+                <strong>LiteLLM Proxy</strong>
+                <span>Clés API, budgets, modèles · port 4000</span>
+            </a>
+            <a class="entry" href="http://localhost:9000">
+                <strong>Authentik SSO</strong>
+                <span>OIDC · port 9000</span>
+            </a>
+        </div>
+        <footer>
+            Docs : GO_LIVE · Branding · Commercial · localhost:5432
+        </footer>
+    </main>
+</body>
+</html>
