@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 backups/
+COMMERCIAL.md
 
 *.sql.gz
 .DS_Store
