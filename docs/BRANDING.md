@@ -34,8 +34,3 @@ Dossier : `docs/branding/` et `docs/branding/screenshots/`
 ## Message commercial (1 phrase)
 
 > Open WebUI et LiteLLM à 100 % natifs, PostgreSQL centralisé, SSO Authentik, console Grand Admin — prêt à déployer.
-
-## Ce qu’on ne dit pas
-
-- Pas de SSO « maison » via SQL  
-- Pas de fork / bridage des panels natifs  

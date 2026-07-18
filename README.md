@@ -1,31 +1,31 @@
 # AetherGate
 
-**Infrastructure IA complète, prête à vendre** — Docker Compose.
+Docker stack: Open WebUI + LiteLLM + admin console — chat UI, OpenAI-compatible API, and ops panel for local & cloud LLMs.
 
-## Structure
+## Layout
 
 ```
-litellm/     → config LiteLLM
+litellm/     → LiteLLM config
 admin/       → Grand Admin (FastAPI backend + frontend)
 infra/       → postgres, caddy, authentik, portal, ollama
-docs/        → GO_LIVE, branding
+docs/        → go-live guide, branding
 scripts/     → secrets, e2e, SSO check, backup
 ```
 
-| Accès | URL |
-|-------|-----|
-| Portail | http://localhost |
+| Service | URL |
+|---------|-----|
+| Portal | http://localhost |
 | Grand Admin | http://localhost:9100 (Basic Auth) |
 | Open WebUI | http://localhost:3000 |
 | LiteLLM | http://localhost:4000/ui |
 | Authentik | http://localhost:9000 |
 | Postgres | localhost:5432 |
 
-## Règle d'or
+## Design rule
 
-Open WebUI et LiteLLM à **100 % natifs**, zéro bridage. PostgreSQL centralisé. SSO Authentik. Grand Admin = ops AetherGate uniquement.
+Open WebUI and LiteLLM stay **100% native** — no forks, no panel patching. Shared PostgreSQL. Authentik SSO. Grand Admin handles AetherGate ops only.
 
-## Démarrage
+## Quick start
 
 ```powershell
 python -m venv .venv
@@ -37,10 +37,9 @@ python scripts/e2e_test.py
 python scripts/setup_sso.py
 ```
 
-Prod TLS : voir `docs/GO_LIVE.md` et `docker-compose.prod.yml`.
+Production TLS: see `docs/GO_LIVE.md` and `docker-compose.prod.yml`.
 
 ## Docs
 
-- [Go-Live client](docs/GO_LIVE.md)
+- [Go-Live guide](docs/GO_LIVE.md)
 - [Branding](docs/BRANDING.md)
-- [Commercial / revente](COMMERCIAL.md)
