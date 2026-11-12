@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import subprocess
@@ -12,7 +13,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -23,6 +24,8 @@ from pydantic import BaseModel
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/backups"))
 DATA_DIR = Path(os.environ.get("ADMIN_DATA_DIR", "/data"))
 ALERTS_FILE = DATA_DIR / "alerts.json"
+AUDIT_FILE = DATA_DIR / "audit.log"
+logger = logging.getLogger("aethergate.admin")
 FRONTEND_DIR = Path(
     os.environ.get(
         "FRONTEND_DIR",
@@ -61,6 +64,7 @@ CHECKS = [
 security = HTTPBasic(auto_error=False)
 _monitor_started = False
 _lock = threading.Lock()
+_audit_lock = threading.Lock()
 
 
 class RestoreBody(BaseModel):
@@ -73,6 +77,42 @@ app = FastAPI(
     docs_url="/api/docs",
     redoc_url=None,
 )
+
+
+def _audit(
+    *,
+    actor: str,
+    action: str,
+    ok: bool,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Append one NDJSON event to the durable audit log.
+
+    Stored on the local filesystem (not Postgres) so a cluster
+    restore cannot erase evidence of the restore itself. Append-
+    only + fsync keeps a usable trail under concurrent writers.
+    """
+    event = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "actor": actor,
+        "action": action,
+        "ok": ok,
+        "detail": detail or {},
+    }
+    line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with _audit_lock:
+            with AUDIT_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+    except OSError:
+        logger.exception(
+            "audit write failed action=%s actor=%s",
+            action,
+            actor,
+        )
 
 
 def _probe(url: str, timeout: float = 4.0) -> dict:
@@ -393,13 +433,36 @@ def api_backups(_: str = Depends(_require_auth)) -> dict:
 
 
 @app.post("/api/backup")
-def api_backup(_: str = Depends(_require_auth)) -> dict:
-    return _run_backup()
+def api_backup(actor: str = Depends(_require_auth)) -> dict:
+    result = _run_backup()
+    _audit(
+        actor=actor,
+        action="backup",
+        ok=bool(result.get("ok")),
+        detail={
+            "file": result.get("file"),
+            "error": result.get("error"),
+        },
+    )
+    return result
 
 
 @app.post("/api/restore")
-def api_restore(body: RestoreBody, _: str = Depends(_require_auth)) -> dict:
-    return _run_restore(body.file)
+def api_restore(
+    body: RestoreBody,
+    actor: str = Depends(_require_auth),
+) -> dict:
+    result = _run_restore(body.file)
+    _audit(
+        actor=actor,
+        action="restore",
+        ok=bool(result.get("ok")),
+        detail={
+            "file": body.file,
+            "error": result.get("error"),
+        },
+    )
+    return result
 
 
 @app.get("/api/alerts")
