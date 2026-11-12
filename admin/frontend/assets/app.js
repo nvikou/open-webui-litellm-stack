@@ -64,34 +64,75 @@ async function loadBackups() {
         const info = document.createElement("span");
         info.textContent =
             item.file + " · " + Math.round(item.size_bytes / 1024) + " KB";
-        const btn = document.createElement("button");
-        btn.className = "btn";
-        btn.type = "button";
-        btn.textContent = "Restore";
-        btn.onclick = async () => {
-            if (
-                !confirm(
-                    "Restore " +
-                        item.file +
-                        " ? Cela écrase l'état SQL actuel."
-                )
-            ) {
-                return;
-            }
+        const validateBtn = document.createElement("button");
+        validateBtn.className = "btn";
+        validateBtn.type = "button";
+        validateBtn.textContent = "Validate";
+        validateBtn.onclick = async () => {
             const msg = document.getElementById("msg");
-            msg.textContent = "Restore en cours…";
+            msg.textContent = "Validation du dump…";
             const r = await fetch("/api/restore", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ file: item.file }),
+                body: JSON.stringify({
+                    file: item.file,
+                    dry_run: true,
+                }),
             });
             const out = await r.json();
             msg.textContent = out.ok
-                ? "Restore OK → " + out.file
+                ? "Dry-run OK → " + out.file
                 : "Échec: " + (out.error || "unknown");
         };
+
+        const restoreBtn = document.createElement("button");
+        restoreBtn.className = "btn";
+        restoreBtn.type = "button";
+        restoreBtn.textContent = "Restore";
+        restoreBtn.onclick = async () => {
+            const typed = window.prompt(
+                "Retapez le nom exact du fichier pour confirmer "
+                    + "le restore destructif:\n"
+                    + item.file
+            );
+            if (typed === null) {
+                return;
+            }
+            if (typed !== item.file) {
+                document.getElementById("msg").textContent =
+                    "Confirmation incorrecte — restore annulé.";
+                return;
+            }
+            const msg = document.getElementById("msg");
+            msg.textContent =
+                "Safety backup puis restore en cours…";
+            const r = await fetch("/api/restore", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    file: item.file,
+                    confirm: typed,
+                    dry_run: false,
+                }),
+            });
+            const out = await r.json();
+            if (out.ok) {
+                msg.textContent =
+                    "Restore OK → "
+                    + out.file
+                    + " (safety: "
+                    + (out.safety_backup || "?")
+                    + ")";
+                await loadBackups();
+            } else {
+                msg.textContent =
+                    "Échec: " + (out.error || r.statusText);
+            }
+        };
+
         row.appendChild(info);
-        row.appendChild(btn);
+        row.appendChild(validateBtn);
+        row.appendChild(restoreBtn);
         box.appendChild(row);
     }
 }

@@ -69,7 +69,15 @@ _audit_lock = threading.Lock()
 
 class RestoreBody(BaseModel):
     file: str
+    confirm: str = ""
+    dry_run: bool = True
 
+
+_PG_DUMP_MARKERS = (
+    b"PostgreSQL database cluster dump",
+    b"PostgreSQL database dump",
+    b"-- PostgreSQL",
+)
 
 app = FastAPI(
     title="AetherGate Grand Admin",
@@ -263,13 +271,72 @@ def _list_backups() -> list[dict]:
     return items
 
 
-def _run_restore(filename: str) -> dict:
+def _confirm_matches(confirm: str, expected: str) -> bool:
+    """Timing-safe equality; unequal lengths never match."""
+    if len(confirm) != len(expected):
+        return False
+    return secrets.compare_digest(confirm, expected)
+
+
+def _resolve_dump(filename: str) -> tuple[Path | None, str | None]:
+    """Resolve a backup name under BACKUP_DIR or return an error."""
     safe = Path(filename).name
     if not safe.startswith("aethergate_") or not safe.endswith(".sql"):
-        return {"ok": False, "error": "invalid backup name"}
-    dump = BACKUP_DIR / safe
+        return None, "invalid backup name"
+    dump = (BACKUP_DIR / safe).resolve()
+    try:
+        dump.relative_to(BACKUP_DIR.resolve())
+    except ValueError:
+        return None, "invalid backup name"
     if not dump.is_file():
-        return {"ok": False, "error": "backup not found"}
+        return None, "backup not found"
+    return dump, None
+
+
+def _validate_dump(dump: Path) -> dict:
+    """Validate a pg_dumpall SQL file without applying it."""
+    size = dump.stat().st_size
+    if size == 0:
+        return {"ok": False, "error": "empty dump"}
+    with dump.open("rb") as fh:
+        head = fh.read(8192)
+    if b"\x00" in head:
+        return {"ok": False, "error": "dump looks binary, not SQL"}
+    if not any(marker in head for marker in _PG_DUMP_MARKERS):
+        return {
+            "ok": False,
+            "error": "dump missing PostgreSQL dump header",
+        }
+    return {
+        "ok": True,
+        "file": dump.name,
+        "size_bytes": size,
+    }
+
+
+def _run_restore(filename: str, *, dry_run: bool = True) -> dict:
+    """Validate or apply a dump; fail closed without a safety backup."""
+    dump, err = _resolve_dump(filename)
+    if err is not None:
+        return {"ok": False, "error": err, "dry_run": dry_run}
+
+    validation = _validate_dump(dump)
+    if not validation.get("ok"):
+        return {**validation, "dry_run": dry_run}
+    if dry_run:
+        return {**validation, "dry_run": True}
+
+    safety = _run_backup()
+    if not safety.get("ok"):
+        return {
+            "ok": False,
+            "dry_run": False,
+            "error": (
+                "safety backup failed: "
+                + str(safety.get("error", "unknown"))
+            ),
+        }
+
     user = os.environ.get("POSTGRES_USER", "aethergate")
     password = os.environ.get("POSTGRES_PASSWORD", "")
     host = os.environ.get("POSTGRES_HOST", "postgres")
@@ -286,9 +353,16 @@ def _run_restore(filename: str) -> dict:
     if proc.returncode != 0:
         return {
             "ok": False,
+            "dry_run": False,
+            "safety_backup": safety["file"],
             "error": proc.stderr.decode("utf-8", errors="replace"),
         }
-    return {"ok": True, "file": safe}
+    return {
+        "ok": True,
+        "file": dump.name,
+        "dry_run": False,
+        "safety_backup": safety["file"],
+    }
 
 
 def _load_alerts() -> list[dict]:
@@ -452,13 +526,34 @@ def api_restore(
     body: RestoreBody,
     actor: str = Depends(_require_auth),
 ) -> dict:
-    result = _run_restore(body.file)
+    safe_name = Path(body.file).name
+    if not body.dry_run and not _confirm_matches(
+        body.confirm, safe_name
+    ):
+        _audit(
+            actor=actor,
+            action="restore",
+            ok=False,
+            detail={
+                "file": safe_name,
+                "dry_run": False,
+                "error": "confirm mismatch",
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="confirm must exactly match file name",
+        )
+
+    result = _run_restore(body.file, dry_run=body.dry_run)
     _audit(
         actor=actor,
         action="restore",
         ok=bool(result.get("ok")),
         detail={
-            "file": body.file,
+            "file": safe_name,
+            "dry_run": body.dry_run,
+            "safety_backup": result.get("safety_backup"),
             "error": result.get("error"),
         },
     )
