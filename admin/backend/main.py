@@ -36,6 +36,13 @@ ADMIN_USER = os.environ.get("ADMIN_USERNAME", "grandadmin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 ALERT_WEBHOOK = os.environ.get("ADMIN_ALERT_WEBHOOK", "").strip()
 POLL_SECONDS = int(os.environ.get("ADMIN_MONITOR_SECONDS", "60"))
+AUTH_MAX_FAILURES = int(os.environ.get("ADMIN_AUTH_MAX_FAILURES", "5"))
+AUTH_LOCK_BASE_SECONDS = float(
+    os.environ.get("ADMIN_AUTH_LOCK_BASE", "2")
+)
+AUTH_LOCK_MAX_SECONDS = float(
+    os.environ.get("ADMIN_AUTH_LOCK_MAX", "900")
+)
 
 CHECKS = [
     (
@@ -65,6 +72,9 @@ security = HTTPBasic(auto_error=False)
 _monitor_started = False
 _lock = threading.Lock()
 _audit_lock = threading.Lock()
+_auth_gate_lock = threading.Lock()
+# ip -> {"count": int, "locked_until": monotonic seconds}
+_auth_failures: dict[str, dict[str, float | int]] = {}
 
 
 class RestoreBody(BaseModel):
@@ -138,7 +148,50 @@ def _probe(url: str, timeout: float = 4.0) -> dict:
         return {"ok": False, "status": None, "detail": str(exc)}
 
 
+def _client_ip(request: Request) -> str:
+    """Peer address only — do not trust X-Forwarded-For here."""
+    if request.client is None or not request.client.host:
+        return "unknown"
+    return request.client.host
+
+
+def _auth_lockout_remaining(ip: str) -> float:
+    now = time.monotonic()
+    with _auth_gate_lock:
+        entry = _auth_failures.get(ip)
+        if entry is None:
+            return 0.0
+        return max(0.0, float(entry["locked_until"]) - now)
+
+
+def _auth_register_failure(ip: str) -> tuple[int, float]:
+    """Record a failed attempt; return (failure_count, lockout_seconds)."""
+    now = time.monotonic()
+    with _auth_gate_lock:
+        entry = _auth_failures.setdefault(
+            ip, {"count": 0, "locked_until": 0.0}
+        )
+        count = int(entry["count"]) + 1
+        entry["count"] = count
+        if count < AUTH_MAX_FAILURES:
+            entry["locked_until"] = 0.0
+            return count, 0.0
+        exp = count - AUTH_MAX_FAILURES
+        delay = min(
+            AUTH_LOCK_MAX_SECONDS,
+            AUTH_LOCK_BASE_SECONDS * (2**exp),
+        )
+        entry["locked_until"] = now + delay
+        return count, delay
+
+
+def _auth_clear_failures(ip: str) -> None:
+    with _auth_gate_lock:
+        _auth_failures.pop(ip, None)
+
+
 def _require_auth(
+    request: Request,
     credentials: HTTPBasicCredentials | None = Depends(security),
 ) -> str:
     if not ADMIN_PASSWORD:
@@ -146,20 +199,54 @@ def _require_auth(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="ADMIN_PASSWORD not configured",
         )
+
+    ip = _client_ip(request)
+    remaining = _auth_lockout_remaining(ip)
+    if remaining > 0:
+        retry_after = max(1, int(remaining))
+        _audit(
+            actor=ip,
+            action="auth_lockout",
+            ok=False,
+            detail={
+                "ip": ip,
+                "retry_after_seconds": retry_after,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed auth attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Auth required",
             headers={"WWW-Authenticate": "Basic"},
         )
+
     user_ok = secrets.compare_digest(credentials.username, ADMIN_USER)
     pass_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
     if not (user_ok and pass_ok):
+        failures, lockout = _auth_register_failure(ip)
+        _audit(
+            actor=credentials.username,
+            action="auth_failure",
+            ok=False,
+            detail={
+                "ip": ip,
+                "failures": failures,
+                "lockout_seconds": lockout,
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Basic"},
         )
+
+    _auth_clear_failures(ip)
     return credentials.username
 
 
