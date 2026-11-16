@@ -11,6 +11,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -69,7 +71,8 @@ CHECKS = [
 ]
 
 security = HTTPBasic(auto_error=False)
-_monitor_started = False
+_monitor_stop = threading.Event()
+_monitor_thread: threading.Thread | None = None
 _lock = threading.Lock()
 _audit_lock = threading.Lock()
 _auth_gate_lock = threading.Lock()
@@ -87,13 +90,6 @@ _PG_DUMP_MARKERS = (
     b"PostgreSQL database cluster dump",
     b"PostgreSQL database dump",
     b"-- PostgreSQL",
-)
-
-app = FastAPI(
-    title="AetherGate Grand Admin",
-    version="1.1.0",
-    docs_url="/api/docs",
-    redoc_url=None,
 )
 
 
@@ -524,9 +520,11 @@ def _collect_status() -> dict:
     }
 
 
-def _monitor_loop() -> None:
+def _monitor_loop(stop: threading.Event) -> None:
+    """Poll services until stop is set; sleep is interruptible."""
     prev: dict[str, bool] = {}
-    while True:
+    interval = max(15, POLL_SECONDS)
+    while not stop.is_set():
         status_payload = _collect_status()
         for svc in status_payload["services"]:
             sid = svc["id"]
@@ -559,18 +557,45 @@ def _monitor_loop() -> None:
                     _save_alerts(alerts)
                 _post_webhook({"product": "AetherGate", **alert})
             prev[sid] = ok
-        time.sleep(max(15, POLL_SECONDS))
+        stop.wait(timeout=interval)
 
 
-@app.on_event("startup")
-def _startup() -> None:
-    global _monitor_started
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Start the monitor on boot; join it on shutdown."""
+    global _monitor_thread
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    if not _monitor_started:
-        thread = threading.Thread(target=_monitor_loop, daemon=True)
-        thread.start()
-        _monitor_started = True
+    _monitor_stop.clear()
+    thread = threading.Thread(
+        target=_monitor_loop,
+        args=(_monitor_stop,),
+        name="aethergate-monitor",
+        daemon=True,
+    )
+    thread.start()
+    _monitor_thread = thread
+    logger.info("monitor thread started")
+    try:
+        yield
+    finally:
+        _monitor_stop.set()
+        thread.join(timeout=max(5.0, float(POLL_SECONDS) + 1.0))
+        if thread.is_alive():
+            logger.warning("monitor thread did not stop in time")
+        else:
+            logger.info("monitor thread stopped")
+        _monitor_thread = None
+
+
+app = FastAPI(
+    title="AetherGate Grand Admin",
+    version="1.1.0",
+    docs_url="/api/docs",
+    redoc_url=None,
+    lifespan=_lifespan,
+)
 
 
 @app.get("/api/health")
