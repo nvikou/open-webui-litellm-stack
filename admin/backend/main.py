@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -38,6 +39,9 @@ ADMIN_USER = os.environ.get("ADMIN_USERNAME", "grandadmin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 ALERT_WEBHOOK = os.environ.get("ADMIN_ALERT_WEBHOOK", "").strip()
 POLL_SECONDS = int(os.environ.get("ADMIN_MONITOR_SECONDS", "60"))
+MONITOR_BACKOFF_MAX = float(
+    os.environ.get("ADMIN_MONITOR_BACKOFF_MAX", "900")
+)
 AUTH_MAX_FAILURES = int(os.environ.get("ADMIN_AUTH_MAX_FAILURES", "5"))
 AUTH_LOCK_BASE_SECONDS = float(
     os.environ.get("ADMIN_AUTH_LOCK_BASE", "2")
@@ -71,8 +75,6 @@ CHECKS = [
 ]
 
 security = HTTPBasic(auto_error=False)
-_monitor_stop = threading.Event()
-_monitor_thread: threading.Thread | None = None
 _lock = threading.Lock()
 _audit_lock = threading.Lock()
 _auth_gate_lock = threading.Lock()
@@ -520,73 +522,151 @@ def _collect_status() -> dict:
     }
 
 
-def _monitor_loop(stop: threading.Event) -> None:
-    """Poll services until stop is set; sleep is interruptible."""
+def _record_alert(alert: dict) -> None:
+    """Append one alert under the shared alerts lock."""
+    with _lock:
+        alerts = _load_alerts()
+        alerts.append(alert)
+        _save_alerts(alerts)
+
+
+def _emit_transition(
+    *,
+    sid: str,
+    label: str,
+    ok: bool,
+    detail: str | None,
+) -> None:
+    """Persist and fan-out a down/up transition alert."""
+    alert = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "service": sid,
+        "label": label,
+        "detail": detail if not ok else "recovered",
+        "level": "up" if ok else "down",
+    }
+    _record_alert(alert)
+    _post_webhook({"product": "AetherGate", **alert})
+
+
+def _backoff_delay(base: float, streak: int) -> float:
+    """Exponential delay for a consecutive failure streak."""
+    if streak <= 0:
+        return base
+    return min(MONITOR_BACKOFF_MAX, base * (2 ** (streak - 1)))
+
+
+def _probe_database() -> dict:
+    """Shape a database probe like HTTP service checks."""
+    db = _db_overview()
+    return {
+        "id": "database",
+        "label": "PostgreSQL",
+        "ok": bool(db.get("ok")),
+        "detail": (
+            "reachable" if db.get("ok") else db.get("error", "down")
+        ),
+    }
+
+
+async def _monitor_loop(stop: asyncio.Event) -> None:
+    """Async poll loop with per-service exponential backoff.
+
+    Blocking probes run in a worker thread so the event loop
+    stays responsive to shutdown.
+    """
     prev: dict[str, bool] = {}
-    interval = max(15, POLL_SECONDS)
+    streaks: dict[str, int] = {}
+    next_due: dict[str, float] = {}
+    base = max(15.0, float(POLL_SECONDS))
+
     while not stop.is_set():
-        status_payload = _collect_status()
-        for svc in status_payload["services"]:
-            sid = svc["id"]
-            ok = bool(svc["ok"])
+        now = time.monotonic()
+        targets: list[tuple[str, str, str | None]] = [
+            (key, label, url) for key, label, url in CHECKS
+        ]
+        targets.append(("database", "PostgreSQL", None))
+
+        for sid, label, url in targets:
+            if next_due.get(sid, 0.0) > now:
+                continue
+            if url is None:
+                result = await asyncio.to_thread(_probe_database)
+            else:
+                probed = await asyncio.to_thread(_probe, url)
+                result = {
+                    "id": sid,
+                    "label": label,
+                    "ok": bool(probed.get("ok")),
+                    "detail": probed.get("detail"),
+                }
+
+            ok = bool(result["ok"])
             was = prev.get(sid)
             if was is True and ok is False:
-                alert = {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "service": sid,
-                    "label": svc["label"],
-                    "detail": svc.get("detail"),
-                    "level": "down",
-                }
-                with _lock:
-                    alerts = _load_alerts()
-                    alerts.append(alert)
-                    _save_alerts(alerts)
-                _post_webhook({"product": "AetherGate", **alert})
+                await asyncio.to_thread(
+                    _emit_transition,
+                    sid=sid,
+                    label=label,
+                    ok=False,
+                    detail=result.get("detail"),
+                )
             elif was is False and ok is True:
-                alert = {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "service": sid,
-                    "label": svc["label"],
-                    "detail": "recovered",
-                    "level": "up",
-                }
-                with _lock:
-                    alerts = _load_alerts()
-                    alerts.append(alert)
-                    _save_alerts(alerts)
-                _post_webhook({"product": "AetherGate", **alert})
+                await asyncio.to_thread(
+                    _emit_transition,
+                    sid=sid,
+                    label=label,
+                    ok=True,
+                    detail=None,
+                )
+
+            if ok:
+                streaks[sid] = 0
+                next_due[sid] = now + base
+            else:
+                streaks[sid] = streaks.get(sid, 0) + 1
+                next_due[sid] = now + _backoff_delay(
+                    base, streaks[sid]
+                )
             prev[sid] = ok
-        stop.wait(timeout=interval)
+
+        sleep_for = base
+        if next_due:
+            soonest = min(next_due.values()) - time.monotonic()
+            sleep_for = max(0.5, soonest)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=sleep_for)
+            break
+        except asyncio.TimeoutError:
+            continue
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Start the monitor on boot; join it on shutdown."""
-    global _monitor_thread
-
+    """Start the monitor task on boot; await it on shutdown."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    _monitor_stop.clear()
-    thread = threading.Thread(
-        target=_monitor_loop,
-        args=(_monitor_stop,),
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        _monitor_loop(stop),
         name="aethergate-monitor",
-        daemon=True,
     )
-    thread.start()
-    _monitor_thread = thread
-    logger.info("monitor thread started")
+    logger.info("monitor task started")
     try:
         yield
     finally:
-        _monitor_stop.set()
-        thread.join(timeout=max(5.0, float(POLL_SECONDS) + 1.0))
-        if thread.is_alive():
-            logger.warning("monitor thread did not stop in time")
-        else:
-            logger.info("monitor thread stopped")
-        _monitor_thread = None
+        stop.set()
+        try:
+            await asyncio.wait_for(
+                task,
+                timeout=max(5.0, float(POLL_SECONDS) + 1.0),
+            )
+            logger.info("monitor task stopped")
+        except asyncio.TimeoutError:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            logger.warning("monitor task cancelled after timeout")
 
 
 app = FastAPI(
