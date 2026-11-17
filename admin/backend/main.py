@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -451,21 +452,47 @@ def _run_restore(filename: str, *, dry_run: bool = True) -> dict:
 
 
 def _load_alerts() -> list[dict]:
+    """Read alerts.json; treat missing/corrupt as empty."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not ALERTS_FILE.exists():
         return []
     try:
         return json.loads(ALERTS_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, OSError):
+        logger.exception("failed to read alerts file")
         return []
 
 
 def _save_alerts(alerts: list[dict]) -> None:
+    """Atomically replace alerts.json (temp file + os.replace).
+
+    Callers must hold ``_lock``. Alerts stay on the local filesystem
+    rather than Postgres: this process monitors the database itself,
+    so a DB outage must not erase the "database down" trail.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ALERTS_FILE.write_text(
-        json.dumps(alerts[-100:], ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    payload = json.dumps(
+        alerts[-100:],
+        ensure_ascii=False,
+        indent=2,
     )
+    fd, tmp_name = tempfile.mkstemp(
+        prefix="alerts.",
+        suffix=".tmp",
+        dir=str(DATA_DIR),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, ALERTS_FILE)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        logger.exception("atomic alerts write failed")
+        raise
 
 
 def _post_webhook(payload: dict) -> None:
