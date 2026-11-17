@@ -43,6 +43,12 @@ POLL_SECONDS = int(os.environ.get("ADMIN_MONITOR_SECONDS", "60"))
 MONITOR_BACKOFF_MAX = float(
     os.environ.get("ADMIN_MONITOR_BACKOFF_MAX", "900")
 )
+WEBHOOK_RETRIES = int(os.environ.get("ADMIN_WEBHOOK_RETRIES", "3"))
+WEBHOOK_BACKOFF_BASE = float(
+    os.environ.get("ADMIN_WEBHOOK_BACKOFF", "0.5")
+)
+WEBHOOK_BODY_LIMIT = 500
+WEBHOOK_TIMEOUT = 5.0
 AUTH_MAX_FAILURES = int(os.environ.get("ADMIN_AUTH_MAX_FAILURES", "5"))
 AUTH_LOCK_BASE_SECONDS = float(
     os.environ.get("ADMIN_AUTH_LOCK_BASE", "2")
@@ -79,8 +85,11 @@ security = HTTPBasic(auto_error=False)
 _lock = threading.Lock()
 _audit_lock = threading.Lock()
 _auth_gate_lock = threading.Lock()
+_metrics_lock = threading.Lock()
 # ip -> {"count": int, "locked_until": monotonic seconds}
 _auth_failures: dict[str, dict[str, float | int]] = {}
+_webhook_failures = 0
+_webhook_successes = 0
 
 
 class RestoreBody(BaseModel):
@@ -495,20 +504,83 @@ def _save_alerts(alerts: list[dict]) -> None:
         raise
 
 
-def _post_webhook(payload: dict) -> None:
+def _truncate_body(raw: bytes, limit: int = WEBHOOK_BODY_LIMIT) -> str:
+    """Decode and cap a response body for safe log lines."""
+    text = raw[:limit].decode("utf-8", errors="replace")
+    if len(raw) > limit:
+        return text + "…"
+    return text
+
+
+def _webhook_metrics() -> dict[str, int]:
+    with _metrics_lock:
+        return {
+            "webhook_successes": _webhook_successes,
+            "webhook_failures": _webhook_failures,
+        }
+
+
+def _post_webhook(payload: dict) -> bool:
+    """POST alert payload with retries; never raise to callers.
+
+    Logs status + truncated body on failure, applies exponential
+    backoff between attempts, and increments in-process counters.
+    """
+    global _webhook_failures, _webhook_successes
+
     if not ALERT_WEBHOOK:
-        return
+        return False
+
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        ALERT_WEBHOOK,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    attempts = max(1, WEBHOOK_RETRIES)
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(
+            ALERT_WEBHOOK,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                req, timeout=WEBHOOK_TIMEOUT
+            ) as resp:
+                resp.read(WEBHOOK_BODY_LIMIT + 1)
+            with _metrics_lock:
+                _webhook_successes += 1
+            return True
+        except urllib.error.HTTPError as exc:
+            body = b""
+            try:
+                body = exc.read(WEBHOOK_BODY_LIMIT + 1)
+            except OSError:
+                body = b""
+            logger.warning(
+                "webhook HTTP failure attempt=%s/%s "
+                "status=%s body=%r",
+                attempt,
+                attempts,
+                exc.code,
+                _truncate_body(body),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "webhook failure attempt=%s/%s error=%s",
+                attempt,
+                attempts,
+                exc,
+            )
+        if attempt < attempts:
+            delay = WEBHOOK_BACKOFF_BASE * (2 ** (attempt - 1))
+            time.sleep(delay)
+
+    with _metrics_lock:
+        _webhook_failures += 1
+        failures = _webhook_failures
+    logger.error(
+        "webhook exhausted retries failures_total=%s",
+        failures,
     )
-    try:
-        urllib.request.urlopen(req, timeout=5)
-    except Exception:  # noqa: BLE001
-        pass
+    return False
 
 
 def _collect_status() -> dict:
@@ -707,7 +779,11 @@ app = FastAPI(
 
 @app.get("/api/health")
 def api_health() -> dict:
-    return {"ok": True, "service": "aethergate-admin"}
+    return {
+        "ok": True,
+        "service": "aethergate-admin",
+        "metrics": _webhook_metrics(),
+    }
 
 
 @app.get("/api/status")
