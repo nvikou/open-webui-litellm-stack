@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -49,6 +50,19 @@ WEBHOOK_BACKOFF_BASE = float(
 )
 WEBHOOK_BODY_LIMIT = 500
 WEBHOOK_TIMEOUT = 5.0
+PROBE_TIMEOUT = float(os.environ.get("ADMIN_PROBE_TIMEOUT", "4"))
+PROBE_SCHEMES = frozenset({"http", "https"})
+# Docker DNS names + loopback; extend via ADMIN_PROBE_ALLOW_HOSTS.
+_PROBE_HOST_DEFAULTS = frozenset(
+    {
+        "open-webui",
+        "litellm",
+        "authentik-server",
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
+)
 AUTH_MAX_FAILURES = int(os.environ.get("ADMIN_AUTH_MAX_FAILURES", "5"))
 AUTH_LOCK_BASE_SECONDS = float(
     os.environ.get("ADMIN_AUTH_LOCK_BASE", "2")
@@ -80,6 +94,38 @@ CHECKS = [
         ),
     ),
 ]
+
+
+def _probe_allow_hosts() -> frozenset[str]:
+    """Build the host allowlist for outbound health probes."""
+    hosts = set(_PROBE_HOST_DEFAULTS)
+    extra = os.environ.get("ADMIN_PROBE_ALLOW_HOSTS", "")
+    for part in extra.split(","):
+        host = part.strip().lower()
+        if host:
+            hosts.add(host)
+    return frozenset(hosts)
+
+
+PROBE_ALLOW_HOSTS = _probe_allow_hosts()
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so probes cannot be bounced off-allowlist."""
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_PROBE_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 security = HTTPBasic(auto_error=False)
 _lock = threading.Lock()
@@ -141,17 +187,52 @@ def _audit(
         )
 
 
-def _probe(url: str, timeout: float = 4.0) -> dict:
+def _validate_probe_url(url: str) -> str | None:
+    """Return an error detail if ``url`` is unsafe to probe."""
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        parsed = urlparse(url)
+    except ValueError:
+        return "invalid probe url"
+    if parsed.scheme not in PROBE_SCHEMES:
+        return f"probe scheme not allowed: {parsed.scheme!r}"
+    if parsed.username is not None or parsed.password is not None:
+        return "probe url must not embed credentials"
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return "probe url missing host"
+    if host not in PROBE_ALLOW_HOSTS:
+        return f"probe host not allowlisted: {host}"
+    return None
+
+
+def _probe(url: str, timeout: float = PROBE_TIMEOUT) -> dict:
+    """GET a health URL with SSRF guards (scheme/host/timeout/redirects)."""
+    blocked = _validate_probe_url(url)
+    if blocked is not None:
+        logger.warning("probe blocked detail=%s url=%s", blocked, url)
+        return {"ok": False, "status": None, "detail": blocked}
+
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with _PROBE_OPENER.open(req, timeout=timeout) as resp:
             return {
                 "ok": True,
                 "status": resp.status,
                 "detail": f"HTTP {resp.status}",
             }
     except urllib.error.HTTPError as exc:
+        if exc.code in {301, 302, 303, 307, 308}:
+            return {
+                "ok": False,
+                "status": exc.code,
+                "detail": f"redirect blocked: HTTP {exc.code}",
+            }
         ok = exc.code < 500
-        return {"ok": ok, "status": exc.code, "detail": f"HTTP {exc.code}"}
+        return {
+            "ok": ok,
+            "status": exc.code,
+            "detail": f"HTTP {exc.code}",
+        }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "status": None, "detail": str(exc)}
 
